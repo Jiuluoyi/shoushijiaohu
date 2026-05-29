@@ -1,0 +1,880 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CYBERPUNK GESTURE TREE</title>
+    <style>
+        body { margin:0; overflow:hidden; background:#020005; font-family:'Segoe UI',sans-serif; }
+        canvas { display:block; filter:contrast(1.05) saturate(1.1); }
+
+        /* 赛博朋克 HUD 覆盖层 */
+        #hud {
+            position:absolute; top:0; left:0; width:100%; height:100%;
+            pointer-events:none; z-index:10;
+        }
+        .corner-tl, .corner-tr, .corner-bl, .corner-br {
+            position:absolute; width:40px; height:40px;
+            border-color:rgba(0,255,255,0.3);
+        }
+        .corner-tl { top:20px; left:20px; border-left:1px solid; border-top:1px solid; }
+        .corner-tr { top:20px; right:20px; border-right:1px solid; border-top:1px solid; }
+        .corner-bl { bottom:20px; left:20px; border-left:1px solid; border-bottom:1px solid; }
+        .corner-br { bottom:20px; right:20px; border-right:1px solid; border-bottom:1px solid; }
+
+        #gesture-label {
+            position:absolute; bottom:80px; left:50%; transform:translateX(-50%);
+            color:rgba(0,255,255,0.7); font-size:11px; letter-spacing:6px;
+            text-transform:uppercase; text-shadow:0 0 20px rgba(0,255,255,0.3);
+            font-family:'Courier New',monospace; opacity:0; transition:opacity 0.5s;
+        }
+        #gesture-label.visible { opacity:1; }
+
+        #scan-line {
+            position:absolute; top:0; left:0; width:100%; height:2px;
+            background:linear-gradient(90deg,transparent,rgba(0,255,255,0.4),transparent);
+            animation:scan 4s linear infinite; opacity:0.3;
+        }
+        @keyframes scan { 0%{top:0} 50%{top:100%} 100%{top:0} }
+
+        #fps-counter {
+            position:absolute; top:25px; right:25px;
+            color:rgba(0,255,255,0.3); font-size:10px; font-family:'Courier New',monospace;
+            letter-spacing:2px;
+        }
+
+        #progress-container {
+            position:absolute; bottom:110px; left:50%; transform:translateX(-50%);
+            width:200px; height:1px; background:rgba(0,255,255,0.1);
+            z-index:10; display:none; overflow:visible;
+        }
+        #progress-fill {
+            height:100%; width:0%;
+            background:linear-gradient(90deg,#00e5ff,#00ff88);
+            box-shadow:0 0 8px rgba(0,255,255,0.5);
+            transition:width 0.05s linear;
+        }
+
+        #cam-container {
+            position:absolute; bottom:20px; right:20px; width:120px; height:90px; z-index:5;
+            border-radius:4px; overflow:hidden; border:1px solid rgba(0,255,255,0.15);
+            background:#000; transform:scaleX(-1);
+        }
+        #cam-video { position:absolute; width:100%; height:100%; object-fit:cover; opacity:0.25; }
+        #output-canvas { position:absolute; width:100%; height:100%; z-index:6; }
+    </style>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+</head>
+<body>
+
+<div id="hud">
+    <div class="corner-tl"></div><div class="corner-tr"></div>
+    <div class="corner-bl"></div><div class="corner-br"></div>
+    <div id="scan-line"></div>
+    <div id="gesture-label">⌘ 手势激活 · GESTURE ACTIVE</div>
+    <div id="fps-counter">-- FPS</div>
+</div>
+<div id="progress-container"><div id="progress-fill"></div></div>
+<div id="cam-container">
+    <video id="cam-video" playsinline muted autoplay></video>
+    <canvas id="output-canvas"></canvas>
+</div>
+
+<script>
+// ================= 场景 =================
+const scene = new THREE.Scene();
+scene.fog = new THREE.FogExp2(0x020008, 0.015);
+const camera = new THREE.PerspectiveCamera(50, window.innerWidth/window.innerHeight, 0.1, 120);
+camera.position.set(0, -1.5, 8);
+camera.lookAt(0, -1.5, 0);
+const renderer = new THREE.WebGLRenderer({ antialias:true, powerPreference:"high-performance" });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setClearColor(0x020008);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 0.8;
+document.body.appendChild(renderer.domElement);
+
+// ================= 粒子系统 =================
+const PC = 60000;
+const geo = new THREE.BufferGeometry();
+const pos=[], rand=[], layers=[], sizes=[], edges=[], orbitData=[];
+const ldefs = [
+    {id:0,r:1.2,pet:0,type:'core',ratio:0.05},
+    {id:1,r:3.0,pet:3,type:'normal',ratio:0.15},
+    {id:2,r:5.5,pet:5,type:'normal',ratio:0.25},
+    {id:3,r:8.5,pet:0,type:'scatter',ratio:0.25},
+    {id:4,r:14.0,pet:0,type:'orbit',ratio:0.30}  // 轨道层 30%
+];
+ldefs.forEach(l=>{
+    const cnt=Math.floor(PC*l.ratio);
+    for(let i=0;i<cnt;i++){
+        let th=Math.random()*6.2832, ph=(Math.random()-.5)*Math.PI, x,y,z, isE=false;
+        let r1=Math.random(), r2=Math.random(), r3=Math.random();
+        
+        if(l.type==='orbit'){
+            // 轨道层 - 8条交叉环绕的原子轨道
+            const orbitIdx = Math.floor(Math.random() * 8);
+            const orbitRadius = 2.5 + orbitIdx * 1.6; // 2.5~13.7
+            const origAngle = Math.random() * 6.2832;
+            const tiltX = (orbitIdx - 3.5) * 0.25; // -0.875~0.875
+            const tiltY = orbitIdx * 0.785; // 45°步进
+            
+            // 初始轨道位置（与shader公式一致）
+            let ox = orbitRadius * Math.cos(origAngle);
+            let oy = orbitRadius * Math.sin(origAngle) * 0.3;
+            let oz = orbitRadius * Math.sin(origAngle) * 0.15;
+            
+            // Y轴旋转
+            const cy = Math.cos(tiltY), sy = Math.sin(tiltY);
+            let nx = ox * cy - oz * sy;
+            let nz = ox * sy + oz * cy;
+            ox = nx; oz = nz;
+            
+            // X轴倾斜
+            const cx = Math.cos(tiltX), sx = Math.sin(tiltX);
+            let ny = oy * cx - oz * sx;
+            nz = oy * sx + oz * cx;
+            oy = ny; oz = nz;
+            
+            x = ox; y = oy; z = oz;
+            
+            // 编码：orbitIdx, 归一化相位, 随机种子
+            r1 = orbitIdx / 8.0;
+            r2 = origAngle / 6.2832;
+            r3 = Math.random();
+            
+        } else if(l.type==='normal'){
+            let sh=Math.sin(th*l.pet)*.5+Math.sin(th*l.pet*2.3+1)*.3;
+            sh=Math.pow(Math.abs(sh),.6);
+            let mr=l.r*(.6+.6*sh)+(Math.random()-.5)*.5;
+            let r=mr*Math.sqrt(Math.random());
+            if(r>mr*.97) isE=true;
+            x=r*Math.cos(th); y=r*Math.sin(th);
+            z=r*r*.08*(Math.cos(th*l.pet)*.5)+(Math.random()-.5)*.5;
+        } else if(l.type==='core'){
+            let r=l.r*Math.random();
+            x=r*Math.cos(th)*Math.cos(ph); y=r*Math.sin(th)*Math.cos(ph); z=r*Math.sin(ph);
+        } else {
+            let r=l.r*(.5+Math.random());
+            x=r*Math.cos(th); y=r*Math.sin(th); z=(Math.random()-.5)*4;
+        }
+        
+        pos.push(x,y,z);
+        rand.push(r1,r2,r3);
+        layers.push(l.id); edges.push(isE?1:0);
+        sizes.push(isE?.5:l.type==='scatter'?Math.random()*.7:l.type==='orbit'?Math.random()*.5+.15:Math.random()*.9+.4);
+    }
+});
+geo.setAttribute('position',new THREE.Float32BufferAttribute(pos,3));
+geo.setAttribute('aRandom',new THREE.Float32BufferAttribute(rand,3));
+geo.setAttribute('aLayer',new THREE.Float32BufferAttribute(layers,1));
+geo.setAttribute('aSize',new THREE.Float32BufferAttribute(sizes,1));
+geo.setAttribute('aEdge',new THREE.Float32BufferAttribute(edges,1));
+
+// ===== 粒子树位置（梦幻白蓝发光树）=====
+const tPos = [], tCnt = Math.floor(PC*0.28); // 提升粒子密度
+const branchPoints = [];
+
+// 生成主要枝干路径
+function generateBranch(startX, startY, startZ, length, thickness, angleX, angleY, depth) {
+    if (depth <= 0 || length < 0.25) return;
+    
+    const segments = Math.floor(length * 16); // 更密集的枝干点
+    let cx = startX, cy = startY, cz = startZ;
+    
+    for (let i = 0; i < segments; i++) {
+        const t = i / segments;
+        const curThick = thickness * (1 - t * 0.42);
+        
+        // 蜿蜒生长
+        cx += Math.sin(angleX + t * 2.5) * 0.1;
+        cy += length / segments;
+        cz += Math.cos(angleY + t * 1.8) * 0.07;
+        
+        // 记录枝干点
+        branchPoints.push({x: cx, y: cy, z: cz, thick: curThick, isBranch: true});
+        
+        // 分叉（更频繁）
+        if (t > 0.4 && Math.random() < 0.35 && depth > 1) {
+            const branchLen = length * 0.62 * (0.55 + Math.random() * 0.5);
+            generateBranch(
+                cx, cy, cz, branchLen, curThick * 0.48,
+                angleX + (Math.random() - 0.5) * 2.5,
+                angleY + (Math.random() - 0.5) * 2.5,
+                depth - 1
+            );
+        }
+    }
+}
+
+// 生成主树干和分支 - 移到画面底部
+generateBranch(0, -5.5, 0, 2.2, 0.5, 0, 0, 6);
+generateBranch(0, -3.8, 0, 2.0, 0.35, 0.6, 0.25, 5);
+generateBranch(0, -3.5, 0, 1.7, 0.28, -0.5, -0.4, 4);
+generateBranch(0, -3.0, 0, 1.6, 0.26, 0.9, 0.7, 4);
+generateBranch(0, -2.5, 0, 1.4, 0.24, -0.85, -0.55, 4);
+generateBranch(0, -2.2, 0, 1.3, 0.22, 1.15, -0.45, 3);
+generateBranch(0, -2.0, 0, 1.1, 0.2, -1.0, 0.35, 3);
+generateBranch(0, -1.8, 0, 0.9, 0.18, 0.7, -0.3, 3);
+
+// 单独存储粒子树属性数组
+const tPosArray = [], tIsBranch = [], tIsHighlight = [], tIsOutline = [];
+
+for(let i=0;i<PC;i++){
+    let x,y,z, isBranch = 0, isHighlight = 0, isOutline = 0;
+    
+    if(i<tCnt){
+        // 枝干粒子
+        if (i < tCnt * 0.18 && branchPoints.length > 0) {
+            const bp = branchPoints[Math.floor(Math.random() * branchPoints.length)];
+            const offset = (Math.random() - 0.5) * bp.thick * 2.2;
+            x = bp.x + offset;
+            y = bp.y + (Math.random() - 0.5) * 0.12;
+            z = bp.z + offset;
+            isBranch = 1;
+        } else {
+            // 树冠粒子 - 移到底部区域
+            const t = (i - tCnt * 0.18) / (tCnt * 0.82);
+            const height = 4.5;
+            y = -3.0 + t * height;
+            
+            // 改良树冠形状：铃形曲线，中部最宽、顶部紧凑收尖
+            const canopyShape = Math.pow(Math.sin(t * Math.PI * 0.92), 0.65) * 1.38 + 0.08;
+            const radius = canopyShape * (2.8 + Math.random() * 2.2);
+            const angle = Math.random() * 6.2832;
+            
+            // 保持水平椭圆分布
+            x = radius * Math.cos(angle) * (0.9 + Math.random() * 0.5);
+            z = radius * Math.sin(angle) * 0.55 * (0.9 + Math.random() * 0.4);
+            
+            // 检测边缘粒子（用于天蓝色轮廓）—— 更宽边缘带 + 更高概率
+            const distFromCenter = Math.sqrt(x*x + z*z);
+            const maxRadius = canopyShape * 3.0;
+            if (distFromCenter > maxRadius * 0.6 && Math.random() < 0.75) {
+                isOutline = 1; // 天蓝色轮廓
+            }
+            
+            // 亮斑
+            if (Math.random() < 0.06 && t > 0.2 && t < 0.85) {
+                isHighlight = 1;
+            }
+        }
+    } else {
+        const a=Math.random()*6.2832, rb=35+Math.random()*60;
+        x=rb*Math.cos(a); z=rb*Math.sin(a); y=(Math.random()-.5)*35;
+    }
+    tPosArray.push(x,y,z);
+    tIsBranch.push(isBranch);
+    tIsHighlight.push(isHighlight);
+    tIsOutline.push(isOutline);
+}
+geo.setAttribute('aTreePos',new THREE.Float32BufferAttribute(tPosArray,3));
+geo.setAttribute('aIsBranch',new THREE.Float32BufferAttribute(tIsBranch,1));
+geo.setAttribute('aIsHighlight',new THREE.Float32BufferAttribute(tIsHighlight,1));
+geo.setAttribute('aIsOutline',new THREE.Float32BufferAttribute(tIsOutline,1));
+
+// ================= 着色器 =================
+const vs = `
+uniform float uTime; uniform float uScale;
+uniform float uTreeActive; uniform float uTreeProgress;
+attribute vec3 aRandom; attribute float aLayer;
+attribute float aSize; attribute float aEdge; attribute vec3 aTreePos;
+attribute float aIsBranch; attribute float aIsHighlight; attribute float aIsOutline;
+varying float vLayer; varying float vEdge;
+varying float vHeartBlend; varying float vRingBlend;
+varying float vTreeBlend; varying float vTreeProgress; varying vec3 vRand;
+varying float vIsBranch; varying float vIsHighlight; varying float vIsOutline;
+
+// Simplex Noise (condensed)
+vec3 m289(vec3 x){return x-floor(x*(1./289.))*289.;}
+vec4 m289v(vec4 x){return x-floor(x*(1./289.))*289.;}
+vec4 perm(vec4 x){return m289v(((x*34.)+1.)*x);}
+vec4 tISqrt(vec4 r){return 1.79284291400159-.85373472095314*r;}
+float snoise(vec3 v){
+    const vec2 C=vec2(1./6.,1./3.); const vec4 D=vec4(0.,.5,1.,2.);
+    vec3 i=floor(v+dot(v,C.yyy)); vec3 x0=v-i+dot(i,C.xxx);
+    vec3 g=step(x0.yzx,x0.xyz); vec3 l=1.-g;
+    vec3 i1=min(g.xyz,l.zxy); vec3 i2=max(g.xyz,l.zxy);
+    vec3 x1=x0-i1+C.xxx; vec3 x2=x0-i2+C.yyy; vec3 x3=x0-D.yyy;
+    i=m289(i);
+    vec4 p=perm(perm(perm(i.z+vec4(0,i1.z,i2.z,1))+i.y+vec4(0,i1.y,i2.y,1))+i.x+vec4(0,i1.x,i2.x,1));
+    float n=.142857142857; vec3 ns=n*D.wyz-D.xzx;
+    vec4 j=p-49.*floor(p*ns.z*ns.z); vec4 x_=floor(j*ns.z);
+    vec4 y_=floor(j-7.*x_); vec4 x=x_*ns.x+ns.yyyy; vec4 y=y_*ns.x+ns.yyyy;
+    vec4 h=1.-abs(x)-abs(y); vec4 b0=vec4(x.xy,y.xy); vec4 b1=vec4(x.zw,y.zw);
+    vec4 s0=floor(b0)*2.+1.; vec4 s1=floor(b1)*2.+1.; vec4 sh=-step(h,vec4(0));
+    vec4 a0=b0.xzyw+s0.xzyw*sh.xxyy; vec4 a1=b1.xzyw+s1.xzyw*sh.zzww;
+    vec3 p0=vec3(a0.xy,h.x); vec3 p1=vec3(a0.zw,h.y); vec3 p2=vec3(a1.xy,h.z); vec3 p3=vec3(a1.zw,h.w);
+    vec4 nrm=tISqrt(vec4(dot(p0,p0),dot(p1,p1),dot(p2,p2),dot(p3,p3)));
+    p0*=nrm.x; p1*=nrm.y; p2*=nrm.z; p3*=nrm.w;
+    vec4 m=max(.6-vec4(dot(x0,x0),dot(x1,x1),dot(x2,x2),dot(x3,x3)),0.);
+    m=m*m;
+    return 42.*dot(m*m,vec4(dot(p0,x0),dot(p1,x1),dot(p2,x2),dot(p3,x3)));
+}
+vec3 curl(vec3 p){float e=.1; return vec3(snoise(vec3(p.x,p.y+e,p.z))-snoise(vec3(p.x,p.y-e,p.z)),snoise(vec3(p.x,p.y,p.z+e))-snoise(vec3(p.x,p.y,p.z-e)),snoise(vec3(p.x+e,p.y,p.z))-snoise(vec3(p.x-e,p.y,p.z)))*10.;}
+
+void main(){
+    vLayer=aLayer; vEdge=aEdge; vRand=aRandom;
+    vIsBranch=aIsBranch; vIsHighlight=aIsHighlight; vIsOutline=aIsOutline;
+    vec3 p=position;
+
+    // Heart
+    float hb=1.-smoothstep(0.,.35,uScale); vHeartBlend=hb;
+    if(hb>.001){
+        float a=atan(p.x,p.y), d=length(p.xy), mr=(aLayer>2.5?9.5:6.5), nd=min(d/mr,1.);
+        float hx=16.*pow(abs(sin(a)),3.)*sign(sin(a)), hy=13.*cos(a)-5.*cos(2.*a)-2.*cos(3.*a)-cos(4.*a);
+        float pu=.9+.1*sin(uTime*2.+(aLayer>2.5?2.:1.)), hs=(aLayer>2.5?.40:.35)*pu;
+        p=mix(vec3(hx*hs*nd,hy*hs*nd,p.z*nd*(aLayer>2.5?.3:.5)),p,1.-hb);
+    }
+    // Ring - Golden glowing orbital rings (Atom structure)
+    float rb=smoothstep(.55,.75,uScale)*(1.-uTreeActive); vRingBlend=rb;
+    if(rb>.001){
+        // Orbit layer (layer 4) - 8条交叉环绕的原子轨道
+        if(aLayer>3.5){
+            float orbitIdx=floor(aRandom.x*8.); // 0~7
+            float orbitRadius=2.5+orbitIdx*1.6; // 2.5~13.7
+            float orbitSpeed=0.12+aRandom.z*0.28; // 各轨道随机速度
+            float tiltX=(orbitIdx-3.5)*0.25; // -0.875~0.875
+            float tiltY=orbitIdx*0.785; // 0~5.495
+            
+            // 轨道旋转动画
+            float angle=uTime*orbitSpeed+aRandom.y*6.2832;
+            
+            // 螺旋尾迹：35%粒子形成拖尾效果
+            float isTrail=step(aRandom.z,0.35);
+            float trailAngle=angle;
+            float trailRad=orbitRadius;
+            if(isTrail>0.5){
+                float trailPhase=aRandom.z/0.35; // 0~1
+                trailAngle=angle-trailPhase*2.5;
+                trailRad=orbitRadius*(1.0-trailPhase*0.22);
+            }
+            
+            // 基础椭圆轨道
+            vec3 op=vec3(
+                trailRad*cos(trailAngle),
+                trailRad*sin(trailAngle)*0.3,
+                trailRad*sin(trailAngle)*0.15
+            );
+            
+            // Y轴旋转
+            float cy=cos(tiltY),sy=sin(tiltY);
+            float nx=op.x*cy-op.z*sy;
+            float nz=op.x*sy+op.z*cy;
+            op.x=nx; op.z=nz;
+            
+            // X轴倾斜
+            float cx=cos(tiltX),sx=sin(tiltX);
+            float ny=op.y*cx-op.z*sx;
+            nz=op.y*sx+op.z*cx;
+            op.y=ny; op.z=nz;
+            
+            // 微散布
+            op+=(aRandom-0.5)*0.1;
+            
+            p=mix(p,op,pow(rb,0.45));
+        }
+        // Original ring layers 0-3
+        else{
+            float idx=aRandom.x*9.;
+            if(idx<1.){
+                float sg=14., sgh=sg*.5;
+                float it=floor(aRandom.y*sg)/sg, ip=floor(aRandom.z*sgh)/sgh;
+                float th=it*6.2832, ph=acos(2.*ip-1.);
+                float rc=.5*(.55+aRandom.x*.45);
+                vec3 cp=vec3(rc*sin(ph)*cos(th),rc*sin(ph)*sin(th),rc*cos(ph))+(aRandom-.5)*.03;
+                p=mix(p,cp,pow(rb,.6));
+            } else {
+                float rd,ax,ay,sp;
+                if(idx<2.){rd=1.8;ax=0.;ay=0.;sp=.2;}
+                else if(idx<3.){rd=2.6;ax=.7;ay=.15;sp=.15;}
+                else if(idx<4.){rd=3.5;ax=-.4;ay=.9;sp=.12;}
+                else if(idx<5.){rd=4.5;ax=0.;ay=1.5;sp=.1;}
+                else if(idx<6.){rd=5.5;ax=.9;ay=-.3;sp=.08;}
+                else if(idx<7.){rd=6.5;ax=-.25;ay=1.1;sp=.06;}
+                else if(idx<8.){rd=7.5;ax=.55;ay=-.6;sp=.05;}
+                else{rd=9.+aRandom.z*2.;ax=-.35;ay=.7;sp=.04;}
+                rd+=(aRandom.y-.5)*1.;
+                float ph=aRandom.y*6.2832, sv=sp*(.7+aRandom.z*.6), oa=ph+uTime*sv;
+                vec3 op=vec3(rd*cos(oa),rd*sin(oa),0.);
+                float ca=cos(ax),sa=sin(ax),cb=cos(ay),sb=sin(ay);
+                float y1=op.y*ca-op.z*sa, z1=op.y*sa+op.z*ca; op.y=y1; op.z=z1;
+                float x2=op.x*cb-op.z*sb, z2=op.x*sb+op.z*cb; op.x=x2; op.z=z2;
+                op+=(aRandom-.5)*(.08+aRandom.z*.1);
+                p=mix(p,op,pow(rb,.55));
+            }
+        }
+    }
+    // Tree - Dreamy white-blue glowing tree
+    float tb=uTreeActive; vTreeBlend=tb; vTreeProgress=uTreeProgress;
+    if(tb>.001){
+        vec3 tp=aTreePos;
+        float ny=clamp((tp.y+5.5)/7.0,0.,1.);
+        float ph=ny*.08+aRandom.x*.05;
+        float gr=clamp((uTreeProgress-ph)/.92,0.,1.);
+        float eg=1.-pow(1.-gr,3.);
+        tp.y=-9.0*(1.0-eg)+tp.y*eg;
+        
+        // 更柔和的摇摆
+        float sw=sin(uTime*(.18+ny*.22)+tp.y*0.5+aRandom.x*6.28)*(.008+.035*ny);
+        tp.x+=sw; tp.z+=sw*.12;
+        
+        // 生长时的轻微扩散
+        tp.x+=(aRandom.x-.5)*(1.-eg)*.04;
+        tp.z+=(aRandom.y-.5)*(1.-eg)*.04;
+        
+        p=mix(p,tp,tb*smoothstep(0.,.06,gr));
+    }
+
+    float ih=1.-hb, ir=1.-rb, frz=max(hb,rb);
+    float lk=ih*ir*(1.-uTreeActive);
+    float d=length(p.xy);
+    float ra=uTime*.05*(.1+.9*hb)*lk+d*.05*(1.-uScale)*lk;
+    float sr=sin(ra), cr=cos(ra);
+    p.xy=mat2(cr,-sr,sr,cr)*p.xy;
+    vec3 noise=curl(p*.2+uTime*.1);
+    float sl=ih*ir*(1.-uTreeActive);
+    if(aLayer>2.5){ p+=noise*uScale*5.*sl; p*=(1.+uScale*2.2)*sl+frz; }
+    else { p+=noise*uScale*.8*sl; p*=(.4+uScale*1.5)*sl+frz; }
+
+    vec4 mv=modelViewMatrix*vec4(p,1.);
+    gl_Position=projectionMatrix*mv;
+    float ps=(aEdge>.5?1.:(4.*aSize+uScale*2.));
+    if(uTreeActive>.5){
+        float g=uTreeProgress, lm=smoothstep(.2,.8,aRandom.y);
+        float sz=mix(.2,0.5,lm)*(.25+g*.4);
+        // 枝干粒子稍大，轮廓粒子更大更突出，普通树冠粒子更小
+        if(aIsBranch>.5) sz*=1.2;
+        else if(aIsOutline>.5) sz*=1.15; // 轮廓放大
+        else sz*=0.55;
+        ps*=sz;
+    } else { ps*=(.5+rb*.3)*(1.-rb*.3); }
+    gl_PointSize=ps*(10./-mv.z);
+}`;
+
+const fs = `
+uniform vec3 uCol0,uCol1,uCol2,uCol3; uniform float uTime,uTreeActive,uTreeProgress;
+varying float vLayer,vEdge,vHeartBlend,vRingBlend,vTreeBlend,vTreeProgress;
+varying float vIsBranch,vIsHighlight,vIsOutline;
+varying vec3 vRand;
+void main(){
+    vec2 uv=gl_PointCoord.xy-.5; float d=length(uv);
+    if(d>.5)discard;
+    float a=1.-smoothstep(.3,.5,d);
+    vec3 bc=uCol0;
+    if(vLayer>.5&&vLayer<1.5) bc=uCol1;
+    else if(vLayer>1.5&&vLayer<2.5) bc=uCol2;
+    else if(vLayer>2.5) bc=uCol3;
+    vec3 fc=bc;
+    if(vEdge>.5){ fc=vec3(1.,.9,.5)*1.5; a*=1.3; } else a*=.55;
+    if(vLayer>2.5) fc*=1.1;
+
+    // Heart - cyberpunk red
+    if(vHeartBlend>.01){
+        vec3 hc=mix(vec3(1.,.3,.4),vec3(1.,.02,.06),vHeartBlend);
+        fc=mix(fc,hc,vHeartBlend); a*=1.+vHeartBlend*2.;
+        float g=1.-abs(d-.25)*4.; g=max(0.,g);
+        if(vHeartBlend>.8) fc+=vec3(1.,.1,.2)*g*.4;
+    }
+    // Tree - Dreamy white-blue glowing tree with sky blue outline
+    if(vTreeBlend>.01){
+        float h=clamp(vTreeProgress,0.,1.);
+        vec3 fc2;
+        
+        if(vIsOutline>.5){
+            // 天蓝色轮廓 - 鲜艳高亮 + 呼吸脉冲
+            vec3 skyBlue=vec3(0.28,0.78,1.0);   // #47C7FF 浓郁天蓝
+            vec3 skyGlow=vec3(0.55,0.92,1.0);   // #8CEBFF 亮白边缘
+            float pulse=0.65+0.35*sin(uTime*1.6+vRand.x*5.5);
+            fc2=mix(skyBlue,skyGlow,0.35+0.65*pulse);
+            a=1.-smoothstep(.2,.48,d); // 重新计算基础alpha（更宽衰减）
+            a*=3.5; // 大幅提升透明度
+        } else if(vIsBranch>.5){
+            // 枝干 - 白蓝色发光
+            vec3 branchCore=vec3(0.92,0.95,0.98);
+            vec3 branchGlow=vec3(0.75,0.82,0.90);
+            fc2=mix(branchGlow,branchCore,1.-d*1.5);
+            a*=1.4;
+        } else if(vIsHighlight>.5){
+            // 亮斑 - 更亮的白色高光
+            vec3 hlCore=vec3(1.0,1.0,1.0);
+            vec3 hlGlow=vec3(0.95,0.97,1.0);
+            fc2=mix(hlGlow,hlCore,1.-d*2.5);
+            a*=2.2;
+        } else {
+            // 普通树冠粒子
+            float ny=gl_PointCoord.y;
+            vec3 white=vec3(0.96,0.98,1.0);
+            vec3 lightBlue=vec3(0.80,0.88,0.96);
+            vec3 softTint=vec3(0.70,0.82,0.92);
+            
+            fc2=mix(softTint,white,0.4+0.6*smoothstep(0.,.4,d));
+            fc2=mix(fc2,lightBlue,0.15*smoothstep(.3,.7,ny));
+            
+            float twinkle=.92+sin(uTime*0.4+vRand.x*8.)*.08;
+            fc2*=twinkle;
+        }
+        
+        // 生长进度影响亮度
+        float br=.55+.45*h;
+        fc2*=br;
+        
+        fc=mix(fc,fc2,smoothstep(0.,.06,vTreeBlend));
+
+        // 核心发光
+        float core=1.-d*2.0; core=max(0.,core);
+        fc+=vec3(0.92,0.96,1.0)*core*vTreeBlend*.5;
+        
+        // 外光晕
+        float halo=1.-smoothstep(.1,.4,d); halo*=.3;
+        fc+=vec3(0.75,0.88,0.98)*halo*vTreeBlend*.35;
+        
+        // 天蓝色轮廓额外强光晕
+        if(vIsOutline>.5){
+            fc+=vec3(0.28,0.82,1.0)*halo*vTreeBlend*1.2;
+            // 外层散射辉光
+            float outerHalo=1.-smoothstep(.25,.48,d);
+            fc+=vec3(0.35,0.78,1.0)*outerHalo*vTreeBlend*.45;
+        }
+
+        float tr=.55+vRand.x*.2;
+        if(vIsOutline>.5) tr=1.2+vRand.z*.5; // 轮廓粒子更亮
+        a*=tr; a=min(a,vIsOutline>.5?1.6:.72);
+    }
+    // Ring - Golden glowing orbital rings
+    if(vRingBlend>.01&&vTreeBlend<.5){
+        vec3 rc; float aMul=1.0;
+        
+        // Orbit layer (layer 4) - golden white glowing atom structure
+        if(vLayer>3.5){
+            float orbitIdx=floor(vRand.x*8.);
+            
+            // 金色-白色渐变，根据轨道层级
+            vec3 goldCore=vec3(1.0,0.98,0.9);    // 内圈亮白金色
+            vec3 goldMid=vec3(1.0,0.88,0.6);     // 中圈金色
+            vec3 goldOuter=vec3(0.95,0.72,0.35); // 外圈深金
+            
+            if(orbitIdx<2.0) rc=goldCore;
+            else if(orbitIdx<4.0) rc=mix(goldMid,goldCore,0.5);
+            else if(orbitIdx<6.0) rc=goldMid;
+            else rc=mix(goldOuter,goldMid,0.6);
+            
+            // 强烈发光
+            aMul=3.0;
+            
+            // 闪烁效果
+            float sparkle=sin(uTime*(1.2+vRand.z*0.8)+vRand.x*8.0)*0.3+0.7;
+            rc*=1.0+sparkle*0.4;
+            
+            // 核心高光
+            float coreGlow=1.0-d*4.0; 
+            if(coreGlow>0.0){
+                rc+=vec3(1.0,0.95,0.85)*coreGlow*0.6;
+            }
+        }
+        // Original layers 0-3
+        else{
+            float ri=vRand.x*9.;
+            if(ri<1.0){ rc=vec3(3.,2.,.8); aMul=2.5; }
+            else if(ri<2.0) rc=mix(vec3(1.6,.8,.12),vec3(1.2,.6,.08),vRand.y);
+            else if(ri<3.0) rc=mix(vec3(1.4,1.,.2),vec3(1.,.7,.12),vRand.z);
+            else if(ri<4.0) rc=mix(vec3(1.3,.9,.25),vec3(1.,.75,.15),vRand.y);
+            else if(ri<5.0) rc=mix(vec3(1.2,.85,.2),vec3(.9,.65,.12),vRand.z);
+            else if(ri<6.0) rc=mix(vec3(1.,.8,.3),vec3(.8,.6,.18),vRand.y);
+            else if(ri<7.0) rc=mix(vec3(.8,.7,.35),vec3(.65,.5,.22),vRand.z);
+            else if(ri<8.0){ rc=mix(vec3(.65,.55,.4),vec3(.5,.4,.2),vRand.y); aMul=0.85; }
+            else{ rc=mix(vec3(.5,.45,.3),vec3(.35,.3,.18),vRand.x); aMul=0.6; }
+        }
+        
+        vec3 gg=rc*(1.5+vRingBlend*1.2);
+        fc=mix(fc,gg,smoothstep(0.,0.3,vRingBlend));
+        a*=aMul+vRingBlend*1.5;
+    }
+    gl_FragColor=vec4(fc,a);
+}`;
+
+const uniforms = {
+    uTime:{value:0}, uScale:{value:.5},
+    uTreeActive:{value:0}, uTreeProgress:{value:0},
+    uCol0:{value:new THREE.Color('#00d4ff')},
+    uCol1:{value:new THREE.Color('#0088ff')},
+    uCol2:{value:new THREE.Color('#4400ff')},
+    uCol3:{value:new THREE.Color('#00ffcc')}
+};
+const mat = new THREE.ShaderMaterial({
+    vertexShader:vs, fragmentShader:fs, uniforms,
+    transparent:true, depthWrite:false, blending:THREE.AdditiveBlending
+});
+scene.add(new THREE.Points(geo, mat));
+
+// ===== 地面倒影平面 =====
+const groundGeo=new THREE.PlaneGeometry(60,50);
+const groundMat=new THREE.MeshBasicMaterial({
+    color:0x020005, transparent:true, opacity:0.94, side:THREE.DoubleSide,
+    blending:THREE.AdditiveBlending
+});
+const ground=new THREE.Mesh(groundGeo,groundMat);
+ground.rotation.x=-Math.PI/2;
+ground.position.set(0,-5.5,0);
+scene.add(ground);
+
+// 柔和的发光地面圆 - 跟随树根位置
+const glowGeo=new THREE.CircleGeometry(12,64);
+const glowMat=new THREE.MeshBasicMaterial({
+    color:0xffffff, transparent:true, opacity:0,
+    blending:THREE.AdditiveBlending
+});
+const groundGlow=new THREE.Mesh(glowGeo,glowMat);
+groundGlow.rotation.x=-Math.PI/2;
+groundGlow.position.set(0,-5.4,0);
+scene.add(groundGlow);
+
+// 地面网格线（微弱）
+const gridHelper=new THREE.GridHelper(50,100,0x6688aa,0x223344);
+gridHelper.position.y=-5.45;
+gridHelper.material.transparent=true;
+gridHelper.material.opacity=0.05;
+scene.add(gridHelper);
+
+// ===== AR全息检测环 =====
+const ringGeo=new THREE.RingGeometry(0.6,1.0,48);
+const ringMat=new THREE.MeshBasicMaterial({
+    color:0x00ddff, transparent:true, opacity:0,
+    side:THREE.DoubleSide, blending:THREE.AdditiveBlending,
+    depthWrite:false
+});
+const arRing=new THREE.Mesh(ringGeo,ringMat);
+arRing.rotation.x=-Math.PI/2;
+arRing.position.set(0,-4.0,0);
+scene.add(arRing);
+
+// 外圈环
+const ringOuterGeo=new THREE.RingGeometry(0.8,1.0,48);
+const ringOuterMat=new THREE.MeshBasicMaterial({
+    color:0x00ff88, transparent:true, opacity:0,
+    side:THREE.DoubleSide, blending:THREE.AdditiveBlending,
+    depthWrite:false
+});
+const arRingOuter=new THREE.Mesh(ringOuterGeo,ringOuterMat);
+arRingOuter.rotation.x=-Math.PI/2;
+arRingOuter.position.set(0,-4.0,0);
+scene.add(arRingOuter);
+
+// 竖直全息环
+const ringVGeo=new THREE.RingGeometry(0.7,0.9,32);
+const ringVMat=new THREE.MeshBasicMaterial({
+    color:0x00ddff, transparent:true, opacity:0,
+    side:THREE.DoubleSide, blending:THREE.AdditiveBlending,
+    depthWrite:false
+});
+const arRingV=new THREE.Mesh(ringVGeo,ringVMat);
+arRingV.position.set(0,-4.0,0);
+scene.add(arRingV);
+
+// ===== 体积光束 =====
+function makeVolBeam(color,width,height){
+    const c=document.createElement('canvas'); c.width=64; c.height=128;
+    const ctx=c.getContext('2d');
+    const grad=ctx.createLinearGradient(32,0,32,128);
+    grad.addColorStop(0,`rgba(${color[0]},${color[1]},${color[2]},0)`);
+    grad.addColorStop(0.2,`rgba(${color[0]},${color[1]},${color[2]},0.3)`);
+    grad.addColorStop(0.5,`rgba(${color[0]},${color[1]},${color[2]},0.15)`);
+    grad.addColorStop(1,`rgba(${color[0]},${color[1]},${color[2]},0)`);
+    ctx.fillStyle=grad; ctx.fillRect(0,0,64,128);
+    const tex=new THREE.CanvasTexture(c);
+    const sp=new THREE.Sprite(new THREE.SpriteMaterial({
+        map:tex, blending:THREE.AdditiveBlending, transparent:true,
+        depthWrite:false, opacity:0.6
+    }));
+    sp.scale.set(width,height,1);
+    return sp;
+}
+const beam1=makeVolBeam([200,230,255],0.5,7); beam1.position.set(-1.2,-3.5,0); scene.add(beam1);
+const beam2=makeVolBeam([180,220,250],0.6,8); beam2.position.set(1.5,-3.0,0.5); scene.add(beam2);
+const beam3=makeVolBeam([220,240,255],0.4,6); beam3.position.set(-0.6,-4.0,-0.8); scene.add(beam3);
+
+// ===== 光晕 =====
+function mkGlow(r,g,b,sz,op){
+    const c=document.createElement('canvas'); c.width=128; c.height=128;
+    const ctx=c.getContext('2d');
+    const gd=ctx.createRadialGradient(64,64,0,64,64,64);
+    gd.addColorStop(0,`rgba(${r},${g},${b},1)`);
+    gd.addColorStop(.15,`rgba(${r},${g},${b},.7)`);
+    gd.addColorStop(.4,`rgba(${r*0.5|0},${g*0.3|0},${b*0.1|0},.2)`);
+    gd.addColorStop(1,'rgba(0,0,0,0)');
+    ctx.fillStyle=gd; ctx.fillRect(0,0,128,128);
+    const t=new THREE.CanvasTexture(c);
+    const s=new THREE.Sprite(new THREE.SpriteMaterial({
+        map:t, blending:THREE.AdditiveBlending, transparent:true, depthWrite:false, opacity:op
+    }));
+    s.scale.set(sz,sz,1); return s;
+}
+// 白色-蓝色光晕
+scene.add(mkGlow(220,240,255,15,.3));
+scene.add(mkGlow(200,230,250,8,.45));
+scene.add(mkGlow(240,250,255,3,.7));
+scene.add(mkGlow(180,210,240,22,.15));
+
+// ===== 背景星空 =====
+const sCnt=2000, sG=new THREE.BufferGeometry();
+const sP=new Float32Array(sCnt*3), sSz=new Float32Array(sCnt);
+for(let i=0;i<sCnt;i++){
+    sP[i*3]=(Math.random()-.5)*80; sP[i*3+1]=(Math.random()-.5)*80; sP[i*3+2]=(Math.random()-.5)*80-20;
+    sSz[i]=.015+Math.random()*.04;
+}
+sG.setAttribute('position',new THREE.BufferAttribute(sP,3));
+sG.setAttribute('size',new THREE.BufferAttribute(sSz,1));
+scene.add(new THREE.Points(sG,new THREE.PointsMaterial({
+    color:0x88ddff, size:.03, transparent:true, opacity:.4,
+    blending:THREE.AdditiveBlending, depthWrite:false
+})));
+
+// ================= 状态机 =================
+const gl=document.getElementById('gesture-label');
+const fp=document.getElementById('fps-counter');
+const pc=document.getElementById('progress-container');
+const pf=document.getElementById('progress-fill');
+
+let treeProgress=0, isOneFingerUp=false, oneFH=[], curMode='flower';
+const MODE={TREE:'tree',FLOWER:'flower',HEART:'heart'};
+const HN='☝️ GESTURE TREE 粒子树';
+const FN='🌸 BLOOM 昙花';
+const RN='❤️ HEART 爱心';
+
+function updateUI(mode,handActive){
+    if(mode===MODE.TREE&&handActive){
+        gl.textContent=HN; gl.classList.add('visible');
+        pc.style.display=treeProgress<1?'block':'none';
+        if(treeProgress<1) pf.style.width=(treeProgress*100)+'%';
+    } else {
+        if(handActive){
+            const n={tree:HN,flower:FN,heart:RN};
+            gl.textContent=n[mode]||FN;
+            gl.classList.add('visible');
+        } else {
+            gl.classList.remove('visible');
+        }
+        pc.style.display='none';
+    }
+}
+
+// ================= 渲染循环 =================
+const clock=new THREE.Clock();
+let lt=0, ts=.5, cs=.5, ha=false, hlf=0;
+
+function animate(){
+    requestAnimationFrame(animate);
+    const t=clock.getElapsedTime(), dt=Math.min(.05,t-lt); lt=t;
+
+    if(ha){
+        hlf=0;
+        if(isOneFingerUp){
+            treeProgress=Math.min(1,treeProgress+dt*.5);
+            curMode=MODE.TREE;
+        }
+        if(!isOneFingerUp&&treeProgress>0) treeProgress=Math.max(0,treeProgress-dt*.8);
+    } else {
+        hlf++;
+        if(hlf>15&&treeProgress<=0) ts=.4+Math.sin(t*.8)*.3;
+        if(treeProgress>0) treeProgress=Math.max(0,treeProgress-dt*.5);
+    }
+
+    cs+=(ts-cs)*.08;
+    uniforms.uTreeActive.value=treeProgress>0?1:0;
+    uniforms.uTreeProgress.value=treeProgress;
+    uniforms.uTime.value=t;
+    uniforms.uScale.value=cs;
+
+    // AR环动画
+    const ringVis=isOneFingerUp?1:0;
+    ringMat.opacity+=(ringVis*.6-ringMat.opacity)*.05;
+    ringOuterMat.opacity+=(ringVis*.35-ringOuterMat.opacity)*.05;
+    ringVMat.opacity+=(ringVis*.25-ringVMat.opacity)*.05;
+    arRing.scale.set(1+.3*Math.sin(t*2),1+.3*Math.sin(t*2),1);
+    arRingOuter.scale.set(1+.4*Math.sin(t*2+1),1+.4*Math.sin(t*2+1),1);
+    arRingV.rotation.x=Math.sin(t*.5)*.3;
+    arRingV.rotation.z=t*.5;
+
+    // 体积光呼吸
+    beam1.material.opacity=.25+.25*Math.sin(t*.35)*treeProgress;
+    beam2.material.opacity=.2+.2*Math.sin(t*.45+1)*treeProgress;
+    beam3.material.opacity=.15+.15*Math.sin(t*.55+2)*treeProgress;
+    
+    // 地面光晕随树生长
+    glowMat.opacity=treeProgress*.25;
+    glowMat.color.setHSL(0.58,0.3,0.9);
+
+    updateUI(curMode,ha);
+
+    // FPS
+    fp.textContent=Math.round(1/dt)+' FPS';
+
+    // 场景微动（浅景深感）
+    camera.position.x=Math.sin(t*.08)*.8;
+    camera.lookAt(0,-1.5+Math.sin(t*.05)*.2,0);
+
+    renderer.render(scene,camera);
+}
+animate();
+
+// ================= MediaPipe =================
+const video=document.getElementById('cam-video');
+const oc=document.getElementById('output-canvas');
+const ocx=oc.getContext('2d');
+
+function onResults(results){
+    ocx.save(); ocx.clearRect(0,0,oc.width,oc.height);
+    if(results.multiHandLandmarks&&results.multiHandLandmarks.length>0){
+        ha=true;
+        for(const lm of results.multiHandLandmarks){
+            drawConnectors(ocx,lm,HAND_CONNECTIONS,{color:'#00ff88',lineWidth:1.5});
+            drawLandmarks(ocx,lm,{color:'#00ddff',lineWidth:1});
+            const w=lm[0];
+            const iD=Math.sqrt((w.x-lm[8].x)**2+(w.y-lm[8].y)**2);
+            const mD=Math.sqrt((w.x-lm[12].x)**2+(w.y-lm[12].y)**2);
+            const rD=Math.sqrt((w.x-lm[16].x)**2+(w.y-lm[16].y)**2);
+            const pD=Math.sqrt((w.x-lm[20].x)**2+(w.y-lm[20].y)**2);
+            const fu=iD>0.18&&mD<0.22&&rD<0.22&&pD<0.22;
+            oneFH.push(fu);
+            if(oneFH.length>3) oneFH.shift();
+            isOneFingerUp=oneFH.length>=2&&oneFH.filter(v=>v).length>=2;
+
+            const m=lm[12];
+            const di=Math.sqrt((w.x-m.x)**2+(w.y-m.y)**2);
+            ts=Math.max(0,Math.min(1.2,(di-.20)/.50));
+        }
+        // 更新AR环位置到指尖
+        const idx=results.multiHandLandmarks[0][8];
+        if(idx){
+            const sx=(idx.x-.5)*12, sy=-(idx.y)*8+2;
+            arRing.position.set(sx,sy,-2);
+            arRingOuter.position.set(sx,sy,-2);
+            arRingV.position.set(sx,sy,-2);
+        }
+    } else {
+        ha=false; isOneFingerUp=false; oneFH=[];
+    }
+    ocx.restore();
+}
+
+const hands=new Hands({locateFile:f=>`https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}`});
+hands.setOptions({maxNumHands:1,modelComplexity:1,minDetectionConfidence:.5,minTrackingConfidence:.5});
+hands.onResults(onResults);
+new Camera(video,{onFrame:async()=>{
+    if(oc.width!==video.videoWidth) {oc.width=video.videoWidth||160; oc.height=video.videoHeight||120;}
+    await hands.send({image:video});
+},width:320,height:240}).start().catch(e=>console.error(e));
+
+window.addEventListener('resize',()=>{
+    camera.aspect=window.innerWidth/window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth,window.innerHeight);
+});
+</script>
+</body>
+</html>
